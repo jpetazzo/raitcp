@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import errno
 import logging
 import os
 import random
@@ -121,8 +122,12 @@ class Peer(object):
         log.info(f"Connecting from {localaddr} to {remoteaddr}:{remoteport}.")
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.bind((localaddr, 0))
-        # FIXME make this non-blocking
-        self.socket.connect((remoteaddr, remoteport))
+        self.socket.setblocking(False)
+        try:
+            self.socket.connect((remoteaddr, remoteport))
+        except os.error as e:
+            if e.errno == errno.EINPROGRESS:
+                pass
         if self.remote_side == RIGHT:
             cid = self.connection.cid
             bytes_received = self.connection.bytes_received[other(self.remote_side)]

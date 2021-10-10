@@ -85,6 +85,10 @@ Note: just leave it running a few seconds. `raitcp` is supposed to resist
 occasional connection breaks, but it probably won't do well under a storm
 of TCP-RESET.
 
-## WIP
+## Issues, bugs...
 
-Connections are blocking at this point. This needs to be fixed.
+- We buffer data forever, so if a peer becomes unavailable for a while,
+  we might use up a lot of memory, then send them a lot of data when (if)
+  they come back
+- It would be great to keep some stats about when a peer was seen last time
+- Also write logs to separate log file (or maybe logs to stdout, stats to stderr?)
