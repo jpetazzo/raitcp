@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 
+import logging
+import os
 import random
 import select
 import socket
 import string
+import struct
 import sys
 import time
+import yaml
+
 
 # Left side = accepts client connection, connects to multiple outs
 # Right side = accepts multiple ins, connects to server
@@ -20,84 +25,142 @@ def other(side):
     return {LEFT: RIGHT, RIGHT: LEFT}[side]
 
 
-from config import left_config, right_config
+if os.environ.get("DEBUG", "")[:1].upper() in ["Y", "1"]:
+    DEBUG = True
+    logging.basicConfig(level=logging.DEBUG)
+else:
+    DEBUG = False
+    logging.basicConfig()
+log = logging
 
 
-def setup(config):
+def setup(config, side):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", config["listen_port"]))
+    s.bind(("0.0.0.0", config[side]["bindport"]))
     s.listen(4)
-    listeners.append(Listener(s, config["side"], config["connect_from_to_port"]))
+    listeners.append(Listener(s, side, config[side]["endpoints"]))
+
+
+def encode_u64(n):
+    return struct.pack("!Q", n)
+
+
+def decode_u64(b):
+    return struct.unpack("!Q", b)[0]
 
 
 class Listener(object):
-    def __init__(self, socket, side, connect_from_to_port):
+    def __init__(self, socket, side, remote_endpoints):
         self.socket = socket
-        self.side = side
-        self.connect_from_to_port = connect_from_to_port
+        self.remote_side = side
+        self.remote_endpoints = remote_endpoints
 
     def fileno(self):
         return self.socket.fileno()
 
     def when_readable(self):
-        s, addr_info = self.socket.accept()
-        print(f"Accepted connection from {addr_info}.")
-        if self.side == LEFT:
-            # Create new connection; this generates the cid.
-            connection = Connection(None, self.connect_from_to_port, other(self.side))
-            print(f"Generated new connection id {connection.cid}.")
+        s, remote_addr = self.socket.accept()
+        log.info(f"Accepted connection from {remote_addr}.")
+        if self.remote_side == LEFT:
+            # "LEFT" side is client-side, so when we accept
+            # a connection, we generate a connection ID,
+            # establish multiple connections to the "RIGHT"
+            # side, and send that connection ID on each of them.
+            connection = Connection(other(self.remote_side), self.remote_endpoints)
+            log.info(f"Generated new connection id {connection.cid}.")
             connections[connection.cid] = connection
-            peer = Peer(s, self.side, addr_info, connection)
-            connection.peers[peer.side].append(peer)
+            peer = Peer(self.remote_side, remote_addr, connection, s)
+            connection.peers[peer.remote_side].append(peer)
+            # Also don't read a bytes_received count on that side!
+            peer.bytes_received = 0
         else:
-            # We need to read the connection id, but we must do it in a non-blocking way.
-            # So we create a connection-less Peer and put in in the special queue.
-            peer = Peer(s, self.side, addr_info, None)
-            peer.connect_from_to_port = self.connect_from_to_port
+            # "RIGHT" side is the server-side, so when we accept
+            # a connection, we must figure out to which mirrored
+            # connection it belongs.
+            # We need to read the connection id, but we must do it
+            # in a non-blocking way. So we create a connection-less 
+            # Peer and put in in the special queue, where it will
+            # fill its input buffer until we have the connection id.
+            peer = Peer(self.remote_side, remote_addr, None, s)
+            peer.remote_endpoints = self.remote_endpoints
             newpeers.append(peer)
 
 
 class Peer(object):
-    def __init__(self, socket, side, desc, connection):
-        self.cid_buffer = b""
+    def __init__(self, remote_side, remote_addr, connection, socket=None):
         self.socket = socket
-        self.side = side
-        self.desc = desc
+        self.remote_side = remote_side
+        self.remote_addr = remote_addr
         self.connection = connection
-        self.bytes_received = 0
+        self.bytes_received = None
+        self.input_buffer = b""
         self.output_buffer = b""
         # Timestamp of the last time we got new data on this connection
         self.was_leader_at = 0
         # Total byte count for new data on this connection
         self.was_source_for = 0
 
+    def __str__(self):
+        if self.connection:
+            cid = self.connection.cid
+        else:
+            cid = None
+        return f"Peer(connection={cid}, remote_side={self.remote_side}, remote_addr={self.remote_addr})"
+
     def fileno(self):
         return self.socket.fileno()
 
-    def when_readable(self):
-        if self.connection:
-            self.when_readable_with_connection()
+    def connect(self):
+        log.debug(f"{self} connecting.")
+        localaddr = self.remote_addr["bindaddr"]
+        remoteaddr = self.remote_addr["connectaddr"]
+        remoteport = self.remote_addr["connectport"]
+        log.info(f"Connecting from {localaddr} to {remoteaddr}:{remoteport}.")
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.bind((localaddr, 0))
+        # FIXME make this non-blocking
+        self.socket.connect((remoteaddr, remoteport))
+        if self.remote_side == RIGHT:
+            cid = self.connection.cid
+            bytes_received = self.connection.bytes_received[other(self.remote_side)]
+            log.debug(f"{self} sending connection id {cid} and byte position {bytes_received}")
+            self.output_buffer += cid
+            self.output_buffer += encode_u64(bytes_received)
         else:
-            self.when_readable_without_connection()
+            # Don't expect a bytes_received header from the server
+            self.bytes_received = 0
 
-    def when_readable_without_connection(self):
-        # We only read 1 byte at a time. It's a bit inefficient, but we only
-        # do it 4 times, so who cares.
-        self.cid_buffer += self.socket.recv(1)
-        if len(self.cid_buffer) == 4:
-            cid = self.cid_buffer
-            if cid not in connections:
-                connection = Connection(
-                    cid, self.connect_from_to_port, other(self.side)
-                )
-                connections[cid] = connection
-            self.connection = connections[cid]
-            self.connection.peers[self.side].append(self)
-            newpeers.remove(self)
+    def when_readable(self):
+        # In "prelude" state, we only read 1 byte at a time.
+        # It's a bit inefficient, but we only read 12 bytes like this.
+        if self.connection is None:
+            self.input_buffer += self.socket.recv(1)
+            if len(self.input_buffer) == 4:
+                cid = self.input_buffer
+                log.debug(f"{self} got connection id: {cid}")
+                self.input_buffer = b''
+                if cid not in connections:
+                    connection = Connection(other(self.remote_side), self.remote_endpoints, cid)
+                    connections[cid] = connection
+                self.connection = connections[cid]
+                self.connection.peers[self.remote_side].append(self)
+                newpeers.remove(self)
+                # And now that we know which connection this belongs to, send the current byte position.
+                self.output_buffer += encode_u64(self.connection.bytes_received[other(self.remote_side)])
+            return
+        if self.bytes_received is None:
+            self.input_buffer += self.socket.recv(1)
+            if len(self.input_buffer) == 8:
+                # FIXME: perhaps we should check that this is <= to the connection bytes received?
+                self.bytes_received = decode_u64(self.input_buffer)
+                log.debug(f"{self} got bytes_received position: {self.bytes_received} / {self.input_buffer}")
+                self.input_buffer = b''
+            return
+        self.receive_and_send()
 
-    def when_readable_with_connection(self):
-        writers = self.connection.peers[other(self.side)]
+    def receive_and_send(self):
+        writers = self.connection.peers[other(self.remote_side)]
         # Normally, we should have at least one writer available,
         # since we connect on demand.
         assert writers
@@ -105,22 +168,22 @@ class Peer(object):
         data = self.socket.recv(RECV_CHUNK_SIZE)
         if len(data) == 0:
             # EOF
-            print(f"Got EOF on {self}, closing peer sockets.")
+            log.warning(f"Got EOF on {self}, closing peer sockets.")
             self.socket.close()
             for writer in writers:
                 writer.socket.close()
             self.connection.open = False
             return
         # Smoke test: check that we're not past the connection reading point.
-        assert self.bytes_received <= self.connection.bytes_received[self.side]
+        assert self.bytes_received <= self.connection.bytes_received[self.remote_side]
         # First, easy case where we are exactly at the reading point.
-        if self.bytes_received == self.connection.bytes_received[self.side]:
+        if self.bytes_received == self.connection.bytes_received[self.remote_side]:
             # Keep the entire data packet.
             new_data = data
         # Now, the less easy case.
         # We are receiving stale data. How stale exactly?
         else:
-            lag = self.connection.bytes_received[self.side] - self.bytes_received
+            lag = self.connection.bytes_received[self.remote_side] - self.bytes_received
             new_bytes = len(data) - lag
             if new_bytes > 0:
                 # There is at least a bit of new data, keep it.
@@ -136,35 +199,36 @@ class Peer(object):
             self.was_source_for += len(new_data)
             for writer in writers:
                 writer.output_buffer += new_data
-            self.connection.bytes_received[self.side] += len(new_data)
+            self.connection.bytes_received[self.remote_side] += len(new_data)
 
     def when_writable(self):
-        bytes_sent = self.socket.send(self.output_buffer[:SEND_CHUNK_SIZE])
-        self.output_buffer = self.output_buffer[bytes_sent:]
+        try:
+            bytes_sent = self.socket.send(self.output_buffer[:SEND_CHUNK_SIZE])
+            self.output_buffer = self.output_buffer[bytes_sent:]
+        except:
+            log.exception("writing to socket")
+            self.connection.open = FIXME
 
-
+# "Connection" represents one "mirrored" TCP connection.
+# It will typically have one peer on the "left" side and
+# multiple peers on the "right" side, or the other way
+# around.
 class Connection(object):
-    def __init__(self, cid, connect_from_to_port, remote_side):
+    def __init__(self, remote_side, remote_endpoints, cid=None):
         if cid is None:
             cid = ""
             for i in range(4):
                 cid += random.choice(string.ascii_letters)
             cid = cid.encode("ascii")
         self.cid = cid
-        self.connect_from_to_port = connect_from_to_port
+        self.remote_endpoints = remote_endpoints
         self.peers = {LEFT: [], RIGHT: []}
         self.bytes_received = {LEFT: 0, RIGHT: 0}
         self.open = True
-
-        for (localaddr, remoteaddr, remoteport) in connect_from_to_port:
-            print(f"Connecting from {localaddr} to {remoteaddr}:{remoteport}.")
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.bind((localaddr, 0))
-            s.connect((remoteaddr, remoteport))
-            if remote_side == RIGHT:
-                s.send(self.cid)
-            peer = Peer(s, remote_side, (localaddr, remoteaddr, remoteport), self)
-            self.peers[peer.side].append(peer)
+        for remote_endpoint in remote_endpoints:
+            peer = Peer(remote_side, remote_endpoint, self)
+            self.peers[peer.remote_side].append(peer)
+            peer.connect()
 
 
 listeners = []
@@ -172,20 +236,19 @@ connections = {}
 newpeers = []
 
 
-side = sys.argv[1]
-if side == "left":
-    setup(left_config)
-elif side == "right":
-    setup(right_config)
-else:
-    print(f"Invalid side {side!r}, should be left or right.")
-    sys.exit(1)
+config_file, side = sys.argv[1], sys.argv[2]
+assert side in [LEFT, RIGHT]
+config = yaml.safe_load(open(config_file))
+setup(config, side)
+
 
 next_stat_time = time.time()
 while True:
     if time.time() > next_stat_time:
-        # Clear screen
-        print("\x1b[H\x1b[2J\x1b[3J")
+        # Show state of connections.
+        # Clear screen.
+        if not DEBUG:
+            print("\x1b[H\x1b[2J\x1b[3J")
         print(time.strftime("%H:%M:%S"))
         print(f"{len(connections)} connections.")
         for connection in connections.values():
@@ -196,9 +259,10 @@ while True:
             for side in (LEFT, RIGHT):
                 for peer in connection.peers[side]:
                     print(
-                        f"- {side}, {peer.desc}, {peer.bytes_received} bytes received, {peer.was_source_for} new bytes, output buffer has {len(peer.output_buffer)} bytes."
+                        f"- {side}, {peer.remote_addr}, {peer.bytes_received} bytes received, {peer.was_source_for} new bytes, output buffer has {len(peer.output_buffer)} bytes."
                     )
         next_stat_time = time.time() + 1  # Change this for stat interval
+    # This is a classic select-based event loop.
     reader_sockets = listeners + newpeers
     writer_sockets = []
     for connection in connections.values():

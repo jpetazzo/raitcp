@@ -1,0 +1,16 @@
+LEFT:
+  bindport: 1935
+  endpoints:
+  - bindaddr: 127.0.0.2
+    connectaddr: 127.0.0.2
+    connectport: 19350
+  - bindaddr: 127.0.0.3
+    connectaddr: 127.0.0.3
+    connectport: 19350
+
+RIGHT:
+  bindport: 19350
+  endpoints:
+  - bindaddr: 0.0.0.0
+    connectaddr: rmtp.server.address
+    connectport: 1935

@@ -27,12 +27,12 @@ This assumes the following:
 
 You can use `raitcp` as such:
 
-- configure `raitcp` (create `config.py`, see `config-example.py`)
-- run `raitcp left` on the client
-- run `raitcp right` on the server
-- `client` connects to `raitcp left`
-- `raitcp left` will establish two connections to `raitcp right`
-- `raitcp right` will connect to `server`
+- create a configuration file (see `example.yaml`)
+- run `raitcp example.yaml LEFT` on the client
+- run `raitcp example.yaml RIGHT` on the server
+- `client` connects to `raitcp LEFT`
+- `raitcp LEFT` establish two connections to `raitcp RIGHT`
+- `raitcp RIGHT` will connect to `server`
 
 Principle of operation: `raitcp` duplicates the data that
 it receives from `client` and `server` on both links.
