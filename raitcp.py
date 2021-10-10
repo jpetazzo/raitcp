@@ -89,6 +89,7 @@ class Listener(object):
 
 class Peer(object):
     def __init__(self, remote_side, remote_addr, connection, socket=None):
+        self.connector = False
         self.socket = socket
         self.remote_side = remote_side
         self.remote_addr = remote_addr
@@ -113,6 +114,7 @@ class Peer(object):
 
     def connect(self):
         log.debug(f"{self} connecting.")
+        self.connector = True
         localaddr = self.remote_addr["bindaddr"]
         remoteaddr = self.remote_addr["connectaddr"]
         remoteport = self.remote_addr["connectport"]
@@ -202,12 +204,8 @@ class Peer(object):
             self.connection.bytes_received[self.remote_side] += len(new_data)
 
     def when_writable(self):
-        try:
-            bytes_sent = self.socket.send(self.output_buffer[:SEND_CHUNK_SIZE])
-            self.output_buffer = self.output_buffer[bytes_sent:]
-        except:
-            log.exception("writing to socket")
-            self.connection.open = FIXME
+        bytes_sent = self.socket.send(self.output_buffer[:SEND_CHUNK_SIZE])
+        self.output_buffer = self.output_buffer[bytes_sent:]
 
 # "Connection" represents one "mirrored" TCP connection.
 # It will typically have one peer on the "left" side and
@@ -270,10 +268,31 @@ while True:
             peers = connection.peers[LEFT] + connection.peers[RIGHT]
             reader_sockets = reader_sockets + peers
             writer_sockets = writer_sockets + [p for p in peers if p.output_buffer]
-    readable_sockets, writable_sockets, error_sockets = select.select(
+    # Remove closed sockets (their fileno() returns -1 apparently?)
+    reader_sockets = [s for s in reader_sockets if s.fileno() >= 0]
+    writer_sockets = [s for s in writer_sockets if s.fileno() >= 0]
+    readable_sockets, writable_sockets, _ = select.select(
         reader_sockets, writer_sockets, [], 1
     )
-    for s in readable_sockets:
-        s.when_readable()
-    for s in writable_sockets:
-        s.when_writable()
+    for p in readable_sockets:
+        try:
+            p.when_readable()
+        except Exception as e:
+            log.exception(f"Couldn't read data from {p}")
+            p.socket.close()
+            if p.connector and p.remote_side==RIGHT:
+                log.info("Reconnecting")
+                newpeer = Peer(p.remote_side, p.remote_addr, p.connection)
+                p.connection.peers[p.remote_side].append(newpeer)
+                newpeer.connect()
+    for p in writable_sockets:
+        try:
+            p.when_writable()
+        except Exception as e:
+            log.exception(f"Couldn't write data to {p}")
+            p.socket.close()
+            if p.connector and p.remote_side==RIGHT:
+                log.info("Reconnecting")
+                newpeer = Peer(p.remote_side, p.remote_addr, p.connection)
+                p.connection.peers[p.remote_side].append(newpeer)
+                newpeer.connect()

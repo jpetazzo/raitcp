@@ -42,9 +42,11 @@ if it's "fresh" data it forwards it to the `client` (or
 from the other link) it just discards it.
 
 If one link becomes congested, `raitcp` will buffer data going
-to that link. It doesn't support disconnections or reconnections
-at the moment.
+to that link.
 
+If there is an error while reading from, or writing to, the
+link that connects from `raitcp left` to `raitcp right`,
+then `raitcp left` will try to reconnect.
 
 ## Useful tips and tricks
 
@@ -72,3 +74,17 @@ sudo iptables -D OUTPUT -s $PRIMARY_SUBNET -d $REMOTE_SERVER -p tcp --dport $REM
 While traffic is being dropped, you will see the output buffers
 (reported by `raitcp`) increase, then drain once the traffic is
 enabled again.
+
+To simulate connection resets, you can use `tcpkill` from package `dsniff`:
+
+```bash
+sudo tcpkill -i lo host 127.0.0.2
+```
+
+Note: just leave it running a few seconds. `raitcp` is supposed to resist
+occasional connection breaks, but it probably won't do well under a storm
+of TCP-RESET.
+
+## WIP
+
+Connections are blocking at this point. This needs to be fixed.
