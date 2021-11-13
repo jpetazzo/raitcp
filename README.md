@@ -1,3 +1,15 @@
+# DEPRECATED
+
+This project was a small experiment to see if it was possible
+to achieve low-latency, highly available, TCP connections by
+combining multiple TCP connections along different paths.
+
+It kind of worked, but I'm not sure that it will be easy to
+handle gracefully all the failure modes; so I'm trying a different
+approach with https://github.com/jpetazzo/tcpou which will use
+UDP as the underlying transport layer.
+
+
 # RAITCP
 
 Redundant Array of Independent TCP streams
